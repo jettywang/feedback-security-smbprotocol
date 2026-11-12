@@ -271,7 +271,14 @@ class TreeConnect:
             self.is_scaleout_share = capabilities.has_flag(ShareCapabilities.SMB2_SHARE_CAP_SCALEOUT)
 
         if require_secure_negotiate:
-            self._verify_dialect_negotiate()
+            try:
+                self._verify_dialect_negotiate()
+            except Exception:
+                # A failed verification means the negotiation info cannot be trusted and the tree
+                # must not be left in a state where it can be used for read/write operations.
+                self._connected = False
+                self.session.tree_connect_table.pop(self.tree_connect_id, None)
+                raise
 
     def disconnect(self):
         """

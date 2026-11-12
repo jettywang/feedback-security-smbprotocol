@@ -2,6 +2,11 @@
 
 ## 1.18.0 - TBD
 
+* Remove a tree connect from the session table and mark it as disconnected when the SMB 3.0/3.0.2 secure
+  negotiate verification fails, so an unverified tree cannot be used for read/write operations
+* Add offline regression tests for the `FSCTL_VALIDATE_NEGOTIATE_INFO` exchange covering tampered GUID,
+  dialect, capabilities and security mode responses, guest sessions, SMB 3.1.1 and signed legacy error paths
+
 ## 1.17.0 - 2026-07-07
 
 * Drop support for Python 3.9, minimum verison if now 3.10

@@ -5,7 +5,7 @@ import io
 import logging
 import warnings
 
-from smbclient._pool import ClientConfig, dfs_request, get_smb_tree
+from smbclient._pool import ClientConfig, _rewrite_referral_path, dfs_request, get_smb_tree
 from smbprotocol import MAX_PAYLOAD_SIZE
 from smbprotocol.exceptions import (
     NoMoreFiles,
@@ -139,7 +139,7 @@ def _resolve_dfs(raw_io):
     raw_path = raw_io.name
 
     referral = dfs_request(raw_io.fd.tree_connect, raw_path[1:])
-    client_config.cache_referral(referral)
+    client_config.cache_referral(referral, request_path=raw_path[1:])
     info = client_config.lookup_referral([p for p in raw_path.split("\\") if p])
     if not info:
         raise ObjectPathNotFound()
@@ -147,7 +147,7 @@ def _resolve_dfs(raw_io):
     connection_kwargs = getattr(raw_io, f"_{SMBRawIO.__name__}__kwargs", {})
 
     for target in info:
-        new_path = raw_path.replace(info.dfs_path, target.target_path, 1)
+        new_path = _rewrite_referral_path(raw_path, info.dfs_path, target.target_path)
 
         try:
             tree, fd_path = get_smb_tree(new_path, **connection_kwargs)

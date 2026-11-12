@@ -2,6 +2,13 @@
 
 ## 1.18.0 - TBD
 
+* Harden DFS referral handling so a response is only cached when `PathConsumed` ends on a complete path component
+  boundary and each entry's `DFSPath` matches that consumed prefix (case insensitive, UTF-16 byte based). Invalid
+  referrals now raise `STATUS_INVALID_PARAMETER` instead of redirecting the connection, preventing a share with a
+  similar prefix or non-ASCII path from serving another share's content
+* Rewrite DFS referral paths component by component so the remaining directories after the DFS prefix are preserved
+  regardless of case differences between the request path and the cached referral prefix
+
 ## 1.17.0 - 2026-07-07
 
 * Drop support for Python 3.9, minimum verison if now 3.10

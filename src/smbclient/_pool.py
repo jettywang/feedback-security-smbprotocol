@@ -136,8 +136,11 @@ class ClientConfig(metaclass=_ConfigSingleton):
 
             self._domain_cache.append(DomainEntry(domain_referral))
 
-    def cache_referral(self, referral):
+    def cache_referral(self, referral, request_path: str | None = None):
         if referral["number_of_referrals"].get_value() > 0:
+            if request_path is not None:
+                _validate_referral_response(referral, request_path)
+
             self._referral_cache.append(ReferralEntry(referral))
 
     def lookup_domain(self, domain_name: str) -> DomainEntry | None:
@@ -149,13 +152,13 @@ class ClientConfig(metaclass=_ConfigSingleton):
     def lookup_referral(self, path_components: list[str]) -> ReferralEntry | None:
         """Checks if the path exists in the DFS referral cache."""
         # A lookup in ReferralCache involves searching for an entry with DFSPathPrefix that is a complete prefix of the
-        # path being looked up.
+        # path being looked up. DFS paths are case insensitive so each component is compared without regard to case.
         self._clear_expired_cache()
         hits = []
         for referral in self._referral_cache:
             referral_path_components = [p for p in referral.dfs_path.split("\\") if p]
             for idx, referral_component in enumerate(referral_path_components):
-                if idx >= len(path_components) or referral_component != path_components[idx]:
+                if idx >= len(path_components) or referral_component.lower() != path_components[idx].lower():
                     break
 
             else:
@@ -185,6 +188,66 @@ class ClientConfig(metaclass=_ConfigSingleton):
 
     def _clear_expired_cache(self) -> None:
         self._referral_cache = [refferal for refferal in self._referral_cache if not refferal.is_expired]
+
+
+def _split_components(path: str) -> list[str]:
+    return [p for p in path.split("\\") if p]
+
+
+def _validate_referral_response(referral: DFSReferralResponse, request_path: str) -> None:
+    """Validate a referral response against the path it was requested for.
+
+    MS-DFSC states the client must only cache entries whose ``DFSPath`` value is a complete prefix of the request path
+    and that the ``PathConsumed`` count ends on a path component boundary. ``PathConsumed`` is measured in bytes of the
+    UTF-16 encoded request path. A response that fails these checks cannot be used to redirect the connection, otherwise
+    a share whose name merely shares a prefix (e.g. ``share`` vs ``share-backup``) could end up serving a request meant
+    for another share.
+    """
+    path_consumed = referral["path_consumed"].get_value()
+    request_bytes = request_path.encode("utf-16-le")
+
+    if path_consumed % 2 != 0 or path_consumed > len(request_bytes):
+        log.warning(
+            "DFS referral PathConsumed %s does not align with the request path %r, ignoring referral",
+            path_consumed,
+            request_path,
+        )
+        raise InvalidParameter()
+
+    consumed = request_bytes[:path_consumed].decode("utf-16-le")
+    if path_consumed < len(request_bytes) and not request_path.startswith(consumed + "\\"):
+        log.warning(
+            "DFS referral PathConsumed %s does not end on a path component boundary for %r, ignoring referral",
+            path_consumed,
+            request_path,
+        )
+        raise InvalidParameter()
+
+    for entry in referral["referral_entries"].get_value():
+        # NameList referrals are only used to populate the domain cache and do not represent a DFS path prefix.
+        if entry["referral_entry_flags"].has_flag(DFSReferralEntryFlags.NAME_LIST_REFERRAL):
+            continue
+
+        if entry.dfs_path.lower() != consumed.lower():
+            log.warning(
+                "DFS referral entry path %r does not match the consumed prefix %r of %r, ignoring referral",
+                entry.dfs_path,
+                consumed,
+                request_path,
+            )
+            raise InvalidParameter()
+
+
+def _rewrite_referral_path(path: str, dfs_path: str, target_path: str) -> str:
+    """Replace the DFS path prefix with the target path while preserving the remaining path.
+
+    The replacement is done component by component so it is case insensitive and cannot match inside a path component.
+    """
+    path_components = _split_components(path)
+    prefix_components = _split_components(dfs_path)
+    target_components = _split_components(target_path)
+    remaining = path_components[len(prefix_components) :]
+    return "\\\\" + "\\".join(target_components + remaining)
 
 
 def dfs_request(tree: TreeConnect, path: str) -> DFSReferralResponse:
@@ -285,8 +348,8 @@ def get_smb_tree(
     # Check if we've already got a referral match for the path specified and use that path instead.
     referral = client_config.lookup_referral(path_split)
     if referral and not referral.is_expired:
-        path = path.replace(referral.dfs_path, referral.target_hint.target_path, 1)
-        path_split = [p for p in path.split("\\") if p]
+        path = _rewrite_referral_path(path, referral.dfs_path, referral.target_hint.target_path)
+        path_split = _split_components(path)
 
     else:
         # If there was no referral match, check if the hostname portion matches any known domain names
@@ -302,14 +365,15 @@ def get_smb_tree(
         if domain_referral:
             # Use the dc hint as the source for the root referral request
             ipc_tree = get_smb_tree(rf"\{domain_referral.dc_hint}\IPC$", **get_kwargs)[0]
-            referral_response = dfs_request(ipc_tree, rf"\{path_split[0]}\{path_split[1]}")
-            client_config.cache_referral(referral_response)
+            root_request_path = rf"\{path_split[0]}\{path_split[1]}"
+            referral_response = dfs_request(ipc_tree, root_request_path)
+            client_config.cache_referral(referral_response, request_path=root_request_path)
             referral = client_config.lookup_referral(path_split)
             if not referral:
                 raise ObjectPathNotFound()
 
-            path = path.replace(referral.dfs_path, referral.target_hint.target_path, 1)
-            path_split = [p for p in path.split("\\") if p]
+            path = _rewrite_referral_path(path, referral.dfs_path, referral.target_hint.target_path)
+            path_split = _split_components(path)
 
     server = path_split[0]
     session = register_session(
@@ -347,8 +411,9 @@ def get_smb_tree(
 
             # The share could be a DFS root, issue a root referral request to the hostname and cache the result.
             ipc_tree = get_smb_tree(ipc_path, **get_kwargs)[0]
+            root_request_path = rf"\{path_split[0]}\{path_split[1]}"
             try:
-                referral = dfs_request(ipc_tree, rf"\{path_split[0]}\{path_split[1]}")
+                referral = dfs_request(ipc_tree, root_request_path)
             except FSDriverRequired:
                 # If the DFS Request fails with STATUS_FS_DRIVER_REQUIRED then
                 # the server doesn't support DFS requests and the original
@@ -358,7 +423,7 @@ def get_smb_tree(
                 # https://github.com/jborean93/smbprotocol/issues/196
                 raise err
 
-            client_config.cache_referral(referral)
+            client_config.cache_referral(referral, request_path=root_request_path)
 
             # Sometimes a DFS referral may return 0 referrals, this needs to be checked here to avoid repeats.
             if not client_config.lookup_referral(path_split):

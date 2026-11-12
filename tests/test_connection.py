@@ -36,8 +36,9 @@ from smbprotocol.exceptions import (
     SMBException,
     StoppedOnSymlink,
 )
-from smbprotocol.header import Smb2Flags, SMB2HeaderResponse
+from smbprotocol.header import Commands, Smb2Flags, SMB2HeaderRequest, SMB2HeaderResponse
 from smbprotocol.ioctl import SMB2IOCTLRequest
+from smbprotocol.open import SMB2CloseRequest, SMB2CreateRequest, SMB2WriteRequest
 from smbprotocol.session import Session
 from smbprotocol.tree import TreeConnect
 
@@ -905,6 +906,201 @@ class TestSMB2TransformHeader:
         assert actual["flags"].get_value() == 1
         assert actual["session_id"].get_value() == 1
         assert actual["data"].get_value() == b"\x01\x02\x03\x04"
+
+
+# Marker bytes that make a related compound easy to recognise on the wire.
+_RELATED_FILE_ID = b"\xff" * 16
+_WRITE_PAYLOAD = b"plaintext-write-secret"
+_TREE_ID = 7
+_SESSION_ID = 1
+_CIPHER_KEY = b"\x11" * 16
+
+
+def _build_create_write_close():
+    """A CREATE/WRITE/CLOSE triplet as used by a related compound request."""
+    create = SMB2CreateRequest()
+    create["buffer_path"] = "file.txt".encode("utf-16-le")
+
+    write = SMB2WriteRequest()
+    write["file_id"] = _RELATED_FILE_ID
+    write["buffer"] = _WRITE_PAYLOAD
+
+    close = SMB2CloseRequest()
+    close["file_id"] = _RELATED_FILE_ID
+
+    return [create, write, close]
+
+
+def _walk_compound_chain(data):
+    """Split a plaintext SMB2 compound request into its individual headers."""
+    headers = []
+    remaining = data
+    while remaining:
+        header = SMB2HeaderRequest()
+        header.unpack(remaining)
+        next_command = header["next_command"].get_value()
+        headers.append(header)
+        if next_command == 0:
+            break
+        remaining = remaining[next_command:]
+    return headers
+
+
+class TestRelatedCompoundEncryption:
+    """Encryption selection for a related compound (CREATE/WRITE/CLOSE).
+
+    A related compound serialises several requests in one transport send. The
+    later headers carry inherited SessionId/TreeId/FileId fields, but the whole
+    request must still be wrapped according to the encryption requirement of the
+    real tree (or session) the first header targets. These tests capture the raw
+    bytes handed to the transport and distinguish an SMB2 plaintext header
+    (``\\xfeSMB``) from an SMB2 transform header (``\\xfdSMB``).
+    """
+
+    @pytest.fixture
+    def mock_connection(self, mocker):
+        connection = Connection(uuid.uuid4(), "server", 445, require_signing=False)
+        connection.dialect = Dialects.SMB_3_1_1
+        connection.cipher_id = Ciphers.AES_128_GCM
+        connection.supports_encryption = True
+        connection.supports_multi_credit = True
+        # Grant enough credits for the whole compound without a live server.
+        connection.sequence_window = {"low": 0, "high": 100}
+
+        transport = mocker.MagicMock()
+        transport.connected = True
+        connection.transport = transport
+
+        session = mocker.MagicMock()
+        session.session_id = _SESSION_ID
+        session.encrypt_data = False
+        session.signing_required = False
+        session.signing_key = None
+        session.encryption_key = _CIPHER_KEY
+        session.decryption_key = _CIPHER_KEY
+        connection.session_table[_SESSION_ID] = session
+
+        tree = mocker.MagicMock()
+        tree.encrypt_data = False
+        tree.is_dfs_share = False
+        session.tree_connect_table = {_TREE_ID: tree}
+
+        return connection, session, tree
+
+    def _send_related_compound(self, connection):
+        requests = connection.send_compound(
+            _build_create_write_close(), _SESSION_ID, _TREE_ID, related=True
+        )
+        assert connection.transport.send.call_count == 1
+        sent = connection.transport.send.call_args[0][0]
+        return requests, sent
+
+    def test_encrypted_tree_wraps_whole_related_compound(self, mock_connection):
+        connection, session, tree = mock_connection
+        # The share requires encryption; the session itself does not.
+        tree.encrypt_data = True
+
+        requests, sent = self._send_related_compound(connection)
+        raw = sent.pack()
+
+        # The on-wire bytes must be an SMB2 transform header, not a plaintext one.
+        assert isinstance(sent, SMB2TransformHeader)
+        assert raw[:4] == b"\xfdSMB"
+        assert raw[:4] != b"\xfeSMB"
+        assert sent["session_id"].get_value() == _SESSION_ID
+
+        # The plaintext compound (including the write payload) must never appear
+        # verbatim on the transport; it is sealed inside the encrypted blob.
+        assert _WRITE_PAYLOAD not in raw
+        assert b"\xfeSMB" not in raw
+
+        # Decrypting the captured message must yield the full CREATE/WRITE/CLOSE
+        # chain, proving the whole request was encapsulated together.
+        plaintext = connection._decrypt(sent)
+        assert sent["original_message_size"].get_value() == len(plaintext)
+        headers = _walk_compound_chain(plaintext)
+        assert [h["command"].get_value() for h in headers] == [
+            Commands.SMB2_CREATE,
+            Commands.SMB2_WRITE,
+            Commands.SMB2_CLOSE,
+        ]
+        # Only the first header carries the real tree id; the related headers
+        # inherit it via SMB2_FLAGS_RELATED_OPERATIONS.
+        assert headers[0]["tree_id"].get_value() == _TREE_ID
+        assert all(
+            h["flags"].has_flag(Smb2Flags.SMB2_FLAGS_RELATED_OPERATIONS) for h in headers[1:]
+        )
+        assert _WRITE_PAYLOAD in plaintext
+        assert len(requests) == 3
+
+    def test_session_encryption_wraps_related_compound_on_plain_tree(self, mock_connection):
+        connection, session, tree = mock_connection
+        # Session-level encryption must apply even when the tree does not ask.
+        session.encrypt_data = True
+        tree.encrypt_data = False
+
+        _, sent = self._send_related_compound(connection)
+        raw = sent.pack()
+
+        assert isinstance(sent, SMB2TransformHeader)
+        assert raw[:4] == b"\xfdSMB"
+        assert _WRITE_PAYLOAD not in raw
+
+        plaintext = connection._decrypt(sent)
+        headers = _walk_compound_chain(plaintext)
+        assert [h["command"].get_value() for h in headers] == [
+            Commands.SMB2_CREATE,
+            Commands.SMB2_WRITE,
+            Commands.SMB2_CLOSE,
+        ]
+
+    def test_plain_tree_and_plain_session_send_cleartext_compound(self, mock_connection):
+        connection, session, tree = mock_connection
+        session.encrypt_data = False
+        tree.encrypt_data = False
+
+        _, sent = self._send_related_compound(connection)
+
+        # No encryption: the transport receives raw plaintext bytes, not a
+        # transform header structure.
+        assert not isinstance(sent, SMB2TransformHeader)
+        assert isinstance(sent, bytes)
+        assert sent[:4] == b"\xfeSMB"
+        assert b"\xfdSMB" not in sent
+
+        headers = _walk_compound_chain(sent)
+        assert [h["command"].get_value() for h in headers] == [
+            Commands.SMB2_CREATE,
+            Commands.SMB2_WRITE,
+            Commands.SMB2_CLOSE,
+        ]
+        assert headers[0]["tree_id"].get_value() == _TREE_ID
+        assert all(
+            h["flags"].has_flag(Smb2Flags.SMB2_FLAGS_RELATED_OPERATIONS) for h in headers[1:]
+        )
+        # Cleartext means the body is genuinely visible on the transport.
+        assert _WRITE_PAYLOAD in sent
+
+    def test_unknown_tree_id_is_rejected_before_transport(self, mock_connection):
+        connection, session, tree = mock_connection
+        tree.encrypt_data = True
+
+        with pytest.raises(SMBException, match="Cannot find Tree with the ID 99"):
+            connection.send_compound(_build_create_write_close(), _SESSION_ID, 99, related=True)
+
+        # The request must be rejected while still in plaintext; nothing is ever
+        # written to the transport layer, encrypted or otherwise.
+        assert connection.transport.send.call_count == 0
+
+    def test_unknown_tree_id_rejected_even_without_encryption(self, mock_connection):
+        connection, session, tree = mock_connection
+        session.encrypt_data = False
+        tree.encrypt_data = False
+
+        with pytest.raises(SMBException, match="Cannot find Tree with the ID 99"):
+            connection.send_compound(_build_create_write_close(), _SESSION_ID, 99, related=True)
+
+        assert connection.transport.send.call_count == 0
 
 
 class TestConnection:

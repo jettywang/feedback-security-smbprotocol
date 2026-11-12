@@ -861,6 +861,17 @@ class SMB2SymbolicLinkErrorResponse(Structure):
         unparsed_path_length = self["unparsed_path_length"].get_value()
 
         b_link_path = to_bytes(to_text(link_path), encoding="utf-16-le")
+
+        # The unparsed path length is a UTF-16 byte count into the original path. A malformed value (odd, negative,
+        # or larger than the path itself) would otherwise silently corrupt the resolved path or fail with an
+        # unhelpful decoding error.
+        if unparsed_path_length < 0 or unparsed_path_length % 2 != 0 or unparsed_path_length > len(b_link_path):
+            raise SMBLinkRedirectionError(
+                "Cannot resolve link target as the server returned an invalid unparsed path length",
+                link_path,
+                print_name,
+            )
+
         unparsed_idx = len(b_link_path) - unparsed_path_length
         base_link_path = to_text(b_link_path[:unparsed_idx], encoding="utf-16-le")
         unparsed_path = to_text(b_link_path[unparsed_idx:], encoding="utf-16-le")
@@ -883,7 +894,23 @@ class SMB2SymbolicLinkErrorResponse(Structure):
                 "Cannot resolve link targets that point to a different host/share", link_path, print_name
             )
 
-        return target_path
+        # The unparsed suffix is appended after the link target was normalised so the final path can still contain
+        # dot segments. Resolve them and reject the link if the result would traverse above the share root, a
+        # server must not be able to redirect a client outside of the share the original path was in.
+        target_parts = []
+        for part in target_path[len(link_share) :].split("\\"):
+            if part in ("", "."):
+                continue
+            elif part == "..":
+                if not target_parts:
+                    raise SMBLinkRedirectionError(
+                        "Cannot resolve link targets that point outside the share root", link_path, print_name
+                    )
+                target_parts.pop()
+            else:
+                target_parts.append(part)
+
+        return (link_share + "\\" + "\\".join(target_parts)) if target_parts else link_share
 
 
 class SMB2ShareRedirectErrorContext(Structure):

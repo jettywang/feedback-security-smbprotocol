@@ -559,6 +559,62 @@ class TestSMB2SymbolicLinkErrorResponse:
         with pytest.raises(SMBLinkRedirectionError, match=re.escape(expected)):
             resp.resolve_path(link_path)
 
+    @pytest.mark.parametrize("unparsed_length", [3, 2**15], ids=["odd", "too-large"])
+    def test_resolve_path_invalid_unparsed_length(self, unparsed_length):
+        b_sub_name = to_bytes("tést", encoding="utf-16-le")
+        resp = SMB2SymbolicLinkErrorResponse()
+        resp["unparsed_path_length"] = unparsed_length
+        resp["substitute_name_offset"] = 0
+        resp["substitute_name_length"] = len(b_sub_name)
+        resp["print_name_offset"] = len(b_sub_name)
+        resp["print_name_length"] = len(b_sub_name)
+        resp["flags"] = SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE
+        resp["path_buffer"] = b_sub_name + b_sub_name
+
+        link_path = "\\\\sérver\\sharé\\foldér\\mylink"
+        expected = (
+            "Encountered symlink at '%s' that points to 'tést' which cannot be redirected: Cannot "
+            "resolve link target as the server returned an invalid unparsed path length" % link_path
+        )
+        with pytest.raises(SMBLinkRedirectionError, match=re.escape(expected)):
+            resp.resolve_path(link_path)
+
+    def test_resolve_path_outside_share_root(self):
+        # The unparsed suffix can traverse above the share root once appended to the resolved target, this must be
+        # rejected rather than sending the escaping path to the server.
+        b_sub_name = to_bytes("tést", encoding="utf-16-le")
+        resp = SMB2SymbolicLinkErrorResponse()
+        resp["unparsed_path_length"] = len(to_bytes("\\..\\..\\..\\escape", encoding="utf-16-le"))
+        resp["substitute_name_offset"] = 0
+        resp["substitute_name_length"] = len(b_sub_name)
+        resp["print_name_offset"] = len(b_sub_name)
+        resp["print_name_length"] = len(b_sub_name)
+        resp["flags"] = SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE
+        resp["path_buffer"] = b_sub_name + b_sub_name
+
+        link_path = "\\\\sérver\\sharé\\mylink\\..\\..\\..\\escape"
+        expected = (
+            "Encountered symlink at '%s' that points to 'tést' which cannot be redirected: Cannot "
+            "resolve link targets that point outside the share root" % link_path
+        )
+        with pytest.raises(SMBLinkRedirectionError, match=re.escape(expected)):
+            resp.resolve_path(link_path)
+
+    def test_resolve_path_normalises_unparsed_suffix(self):
+        # Dot segments in the unparsed suffix that stay inside the share are resolved in the final path.
+        b_sub_name = to_bytes("tést", encoding="utf-16-le")
+        resp = SMB2SymbolicLinkErrorResponse()
+        resp["unparsed_path_length"] = len(to_bytes("\\..\\sibling", encoding="utf-16-le"))
+        resp["substitute_name_offset"] = 0
+        resp["substitute_name_length"] = len(b_sub_name)
+        resp["print_name_offset"] = len(b_sub_name)
+        resp["print_name_length"] = len(b_sub_name)
+        resp["flags"] = SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE
+        resp["path_buffer"] = b_sub_name + b_sub_name
+
+        actual = resp.resolve_path("\\\\sérver\\sharé\\foldér\\mylink\\..\\sibling")
+        assert actual == "\\\\sérver\\sharé\\foldér\\sibling"
+
 
 class TestSMB2ShareRedirectErrorContext:
     def test_create_message(self):

@@ -24,6 +24,7 @@ from smbprotocol.exceptions import (
     SMB2SymbolicLinkErrorResponse,
     SMBConnectionClosed,
     SMBException,
+    SMBLinkRedirectionError,
     SMBResponseException,
 )
 from smbprotocol.header import (
@@ -50,6 +51,12 @@ from smbprotocol.structure import (
 from smbprotocol.transport import Tcp
 
 log = logging.getLogger(__name__)
+
+# The maximum number of times a create request is retried after the server responds with STATUS_STOPPED_ON_SYMLINK.
+# Each redirect costs a full round trip to the server and a misconfigured or malicious server could keep
+# redirecting forever (e.g. two symlinks that point at each other) so the number of retries is bounded. The value
+# is deliberately generous for legitimate symlink chains while still giving up in a predictable timeframe.
+MAX_SYMLINK_REDIRECTS = 16
 
 
 class SecurityMode:
@@ -1021,7 +1028,7 @@ class Connection:
         """
         return self._send(messages, session_id=sid, tree_id=tid, related=related)
 
-    def receive(self, request, wait=True, timeout=None, resolve_symlinks=True):
+    def receive(self, request, wait=True, timeout=None, resolve_symlinks=True, _symlink_redirect_count=0):
         """
         Polls the message buffer of the TCP connection and waits until a valid
         message is received based on the message_id passed in.
@@ -1031,6 +1038,8 @@ class Connection:
             returned in the case of wait=False
         :param timeout: Set a timeout used while waiting for the final response from the server.
         :param resolve_symlinks: Set to automatically resolve symlinks in the path when opening a file or directory.
+        :param _symlink_redirect_count: Internal counter used to bound the number of symlink redirects a single
+            receive call will follow, do not set this manually.
         :return: SMB2HeaderResponse of the received message
         """
         # Only the worker thread delivers responses, so calling receive() from it would wait
@@ -1095,6 +1104,17 @@ class Connection:
                     original_path = tree_share_name + to_text(
                         old_create["buffer_path"].get_value(), encoding="utf-16-le"
                     )
+
+                    if _symlink_redirect_count >= MAX_SYMLINK_REDIRECTS:
+                        # The server keeps redirecting the create to another path, e.g. two symlinks that point at
+                        # each other. Give up with an explainable error instead of retrying forever.
+                        self.outstanding_requests.pop(request.message["message_id"].get_value(), None)
+                        raise SMBLinkRedirectionError(
+                            f"Cannot resolve link targets that require more than {MAX_SYMLINK_REDIRECTS} redirects",
+                            original_path,
+                            reparse_buffer.get_print_name(),
+                        )
+
                     new_path = reparse_buffer.resolve_path(original_path)[len(tree_share_name) :]
 
                     new_open = Open(tree, new_path)
@@ -1117,7 +1137,13 @@ class Connection:
                     # info.
                     error = None
                     try:
-                        new_response = self.receive(new_requests[0], wait=wait, timeout=timeout, resolve_symlinks=True)
+                        new_response = self.receive(
+                            new_requests[0],
+                            wait=wait,
+                            timeout=timeout,
+                            resolve_symlinks=True,
+                            _symlink_redirect_count=_symlink_redirect_count + 1,
+                        )
                     except SMBResponseException as exc:
                         # We need to make sure we fix up the remaining responses before throwing this.
                         error = exc

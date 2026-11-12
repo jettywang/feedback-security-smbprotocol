@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 import pytest
 
 from smbprotocol import Dialects
+from smbprotocol._text import to_text
 from smbprotocol.connection import (
+    MAX_SYMLINK_REDIRECTS,
     Ciphers,
     Connection,
     HashAlgorithms,
@@ -31,13 +33,27 @@ from smbprotocol.connection import (
 )
 from smbprotocol.exceptions import (
     NtStatus,
+    SMB2ErrorContextResponse,
     SMB2ErrorResponse,
+    SMB2SymbolicLinkErrorResponse,
     SMBConnectionClosed,
     SMBException,
+    SMBLinkRedirectionError,
     StoppedOnSymlink,
+    SymbolicLinkErrorFlags,
 )
-from smbprotocol.header import Smb2Flags, SMB2HeaderResponse
+from smbprotocol.file_info import FileAttributes
+from smbprotocol.header import Commands, Smb2Flags, SMB2HeaderResponse
 from smbprotocol.ioctl import SMB2IOCTLRequest
+from smbprotocol.open import (
+    CreateDisposition,
+    CreateOptions,
+    FilePipePrinterAccessMask,
+    ImpersonationLevel,
+    Open,
+    ShareAccess,
+    SMB2CreateResponse,
+)
 from smbprotocol.session import Session
 from smbprotocol.tree import TreeConnect
 
@@ -1380,3 +1396,276 @@ class TestConnection:
             connection.receive(request)
 
         assert len(connection.outstanding_requests) == 0
+
+
+class _FakeTransport:
+    """A transport stand-in that never touches the network."""
+
+    def __init__(self):
+        self.sent = []
+
+    @property
+    def connected(self):
+        return True
+
+    def send(self, data):
+        self.sent.append(data)
+
+
+class _CreateScript:
+    """
+    Scripted SMB server used to test symlink resolution in Connection.receive().
+
+    Every CREATE request that is sent is recorded in attempts as a
+    (path, desired_access) tuple and answered based on the script entry for
+    that path. A script entry is either ("success",) or
+    ("symlink", substitute_name, print_name, flags, unparsed_path_length).
+    """
+
+    DESIRED_ACCESS = FilePipePrinterAccessMask.FILE_READ_DATA | FilePipePrinterAccessMask.FILE_WRITE_DATA
+
+    def __init__(self, script):
+        self.script = script
+        self.attempts = []
+
+    def install(self, connection, monkeypatch):
+        real_send = connection.send
+        real_send_compound = connection.send_compound
+
+        def respond(requests):
+            for request in requests:
+                create = request.get_message_data()
+                path = to_text(create["buffer_path"].get_value(), encoding="utf-16-le")
+                self.attempts.append((path, create["desired_access"].get_value()))
+
+                action = self.script.get(path, ("success",))
+                if action[0] == "symlink":
+                    _, substitute_name, print_name, flags, unparsed_length = action
+                    link = SMB2SymbolicLinkErrorResponse()
+                    link["unparsed_path_length"] = unparsed_length
+                    link["flags"] = flags
+                    link.set_name(print_name, substitute_name)
+
+                    context = SMB2ErrorContextResponse()
+                    context["error_context_data"] = link.pack()
+                    error = SMB2ErrorResponse()
+                    error["error_data"] = [context]
+
+                    self._set_response(request, NtStatus.STATUS_STOPPED_ON_SYMLINK, error.pack())
+                else:
+                    create_resp = SMB2CreateResponse()
+                    create_resp["file_id"] = b"\xff" * 16
+                    self._set_response(request, NtStatus.STATUS_SUCCESS, create_resp.pack())
+
+        def fake_send(message, **kwargs):
+            request = real_send(message, **kwargs)
+            respond([request])
+            return request
+
+        def fake_send_compound(messages, sid, tid, related=False):
+            requests = real_send_compound(messages, sid, tid, related=related)
+            respond(requests)
+            return requests
+
+        monkeypatch.setattr(connection, "send", fake_send)
+        monkeypatch.setattr(connection, "send_compound", fake_send_compound)
+
+    @staticmethod
+    def _set_response(request, status, data):
+        header = SMB2HeaderResponse()
+        header["message_id"] = request.message["message_id"].get_value()
+        header["command"] = Commands.SMB2_CREATE
+        header["session_id"] = request.session_id
+        header["status"] = status
+        header["data"] = data
+        request.response = header
+        request.response_event.set()
+
+
+class TestReceiveSymlinkResolution:
+    @staticmethod
+    def _utf16_len(value):
+        return len(value.encode("utf-16-le"))
+
+    def _setup(self, monkeypatch, script):
+        connection = Connection(uuid.uuid4(), "server", 445)
+        connection.transport = _FakeTransport()
+        connection.dialect = Dialects.SMB_3_1_1
+        connection.sequence_window["high"] = 65535
+
+        session = Session(connection, "user", "pass")
+        session.session_id = 1
+        connection.session_table[1] = session
+
+        tree = TreeConnect(session, "\\\\server\\share")
+        tree.tree_connect_id = 1
+        tree.is_dfs_share = False
+        session.tree_connect_table[1] = tree
+
+        server = _CreateScript(script)
+        server.install(connection, monkeypatch)
+
+        return connection, session, tree, server
+
+    def _send_create(self, connection, session, tree, path):
+        open_file = Open(tree, path)
+        create = open_file.create(
+            ImpersonationLevel.Impersonation,
+            _CreateScript.DESIRED_ACCESS,
+            FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            ShareAccess.FILE_SHARE_READ,
+            CreateDisposition.FILE_OPEN,
+            CreateOptions.FILE_NON_DIRECTORY_FILE,
+            send=False,
+        )[0]
+        return connection.send(create, sid=session.session_id, tid=tree.tree_connect_id)
+
+    def test_follow_relative_target_in_share(self, monkeypatch):
+        connection, session, tree, server = self._setup(
+            monkeypatch,
+            {
+                "dir\\link\\file.txt": (
+                    "symlink",
+                    "target",
+                    "target",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE,
+                    self._utf16_len("\\file.txt"),
+                ),
+            },
+        )
+
+        request = self._send_create(connection, session, tree, "dir\\link\\file.txt")
+        response = connection.receive(request)
+
+        assert response["status"].get_value() == NtStatus.STATUS_SUCCESS
+        assert server.attempts == [
+            ("dir\\link\\file.txt", _CreateScript.DESIRED_ACCESS),
+            ("dir\\target\\file.txt", _CreateScript.DESIRED_ACCESS),
+        ]
+
+    def test_follow_absolute_target_in_share(self, monkeypatch):
+        connection, session, tree, server = self._setup(
+            monkeypatch,
+            {
+                "dir\\link": (
+                    "symlink",
+                    "\\??\\UNC\\server\\share\\other\\file.txt",
+                    "\\\\server\\share\\other\\file.txt",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_ABSOLUTE,
+                    0,
+                ),
+            },
+        )
+
+        request = self._send_create(connection, session, tree, "dir\\link")
+        response = connection.receive(request)
+
+        assert response["status"].get_value() == NtStatus.STATUS_SUCCESS
+        assert server.attempts == [
+            ("dir\\link", _CreateScript.DESIRED_ACCESS),
+            ("other\\file.txt", _CreateScript.DESIRED_ACCESS),
+        ]
+
+    def test_reject_target_beyond_share_root(self, monkeypatch):
+        # The unparsed suffix is appended to the resolved target without further normalisation by the server so a
+        # suffix that traverses above the share root must be rejected before any retry is sent.
+        connection, session, tree, server = self._setup(
+            monkeypatch,
+            {
+                "dir\\link\\..\\..\\..\\outside\\file.txt": (
+                    "symlink",
+                    "target",
+                    "target",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE,
+                    self._utf16_len("\\..\\..\\..\\outside\\file.txt"),
+                ),
+            },
+        )
+
+        request = self._send_create(connection, session, tree, "dir\\link\\..\\..\\..\\outside\\file.txt")
+        expected = "Cannot resolve link targets that point outside the share root"
+        with pytest.raises(SMBLinkRedirectionError, match=expected):
+            connection.receive(request)
+
+        assert server.attempts == [("dir\\link\\..\\..\\..\\outside\\file.txt", _CreateScript.DESIRED_ACCESS)]
+
+    @pytest.mark.parametrize(
+        "unparsed_length",
+        [
+            3,  # odd length cannot be a UTF-16 byte count
+            2**15,  # larger than the original path
+        ],
+        ids=["odd", "too-large"],
+    )
+    def test_reject_invalid_unparsed_path_length(self, monkeypatch, unparsed_length):
+        connection, session, tree, server = self._setup(
+            monkeypatch,
+            {
+                "dir\\link": (
+                    "symlink",
+                    "target",
+                    "target",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE,
+                    unparsed_length,
+                ),
+            },
+        )
+
+        request = self._send_create(connection, session, tree, "dir\\link")
+        expected = "the server returned an invalid unparsed path length"
+        with pytest.raises(SMBLinkRedirectionError, match=expected):
+            connection.receive(request)
+
+        assert server.attempts == [("dir\\link", _CreateScript.DESIRED_ACCESS)]
+
+    def test_reject_target_on_other_share(self, monkeypatch):
+        connection, session, tree, server = self._setup(
+            monkeypatch,
+            {
+                "dir\\link": (
+                    "symlink",
+                    "\\??\\UNC\\server\\other\\file.txt",
+                    "\\\\server\\other\\file.txt",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_ABSOLUTE,
+                    0,
+                ),
+            },
+        )
+
+        request = self._send_create(connection, session, tree, "dir\\link")
+        expected = "Cannot resolve link targets that point to a different host/share"
+        with pytest.raises(SMBLinkRedirectionError, match=expected):
+            connection.receive(request)
+
+        assert server.attempts == [("dir\\link", _CreateScript.DESIRED_ACCESS)]
+
+    def test_redirect_loop_hits_retry_limit(self, monkeypatch):
+        # Two reparse points that keep redirecting to each other must not be followed forever.
+        connection, session, tree, server = self._setup(
+            monkeypatch,
+            {
+                "linkA": (
+                    "symlink",
+                    "linkB",
+                    "linkB",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE,
+                    0,
+                ),
+                "linkB": (
+                    "symlink",
+                    "linkA",
+                    "linkA",
+                    SymbolicLinkErrorFlags.SYMLINK_FLAG_RELATIVE,
+                    0,
+                ),
+            },
+        )
+
+        request = self._send_create(connection, session, tree, "linkA")
+        expected = f"Cannot resolve link targets that require more than {MAX_SYMLINK_REDIRECTS} redirects"
+        with pytest.raises(SMBLinkRedirectionError, match=expected):
+            connection.receive(request)
+
+        # The initial create plus one retry per allowed redirect, alternating between the two links.
+        expected_paths = ["linkA" if i % 2 == 0 else "linkB" for i in range(MAX_SYMLINK_REDIRECTS + 1)]
+        assert server.attempts == [(path, _CreateScript.DESIRED_ACCESS) for path in expected_paths]
